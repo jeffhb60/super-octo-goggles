@@ -6,7 +6,9 @@ DuckDB database. Never touches the network: any accidental fetch attempt
 raises immediately.
 
 The manifest must reference only 'verified', 'retrieved', or
-'not_started' tasks — partial or failed tasks must be recollected first.
+'not_started' tasks — partial or failed tasks must be recollected (or
+recovered) first. Documented cancellations are preserved in the games
+table as canceled rows rather than dropped.
 """
 import argparse
 import json
@@ -17,8 +19,13 @@ from uuid import uuid4
 from ingestion.clients.cache import read_snapshot, digest
 from ingestion.clients.nba import NBAClient
 from ingestion.clients.schedule import parse_schedule
+from ingestion.clients.cancellations import confirmed
 from ingestion.collectors.historical import coverage, KINDS
 
+
+# Game ID of the one documented historical cancellation. Kept here so the
+# lifecycle_status view can label its row without joining to CANCELED.
+CANCELED_GAME_ID = '0021201214'
 
 # Stat columns copied from each game log into the stats tables.
 STATS = (
@@ -95,8 +102,20 @@ CREATE TABLE build_metadata (
 );
 CREATE VIEW game_results AS
     SELECT *,
-        CASE WHEN home_points IS NOT NULL AND away_points IS NOT NULL
-             THEN CAST(home_points > away_points AS INTEGER)
+        -- One documented cancellation is labeled as such; everything else
+        -- is classified from the schedule's game_status.
+        CASE
+            WHEN game_id = '{CANCELED_GAME_ID}'
+                 AND home_points IS NULL
+                 AND away_points IS NULL THEN 'canceled'
+            WHEN game_status = 3 THEN 'completed'
+            WHEN game_status = 1 THEN 'scheduled'
+            WHEN game_status = 2 THEN 'in_progress'
+            ELSE 'unknown'
+        END AS lifecycle_status,
+        CASE
+            WHEN home_points IS NOT NULL AND away_points IS NOT NULL
+            THEN CAST(home_points > away_points AS INTEGER)
         END AS home_win,
         home_points - away_points AS mov
     FROM games;
@@ -115,19 +134,45 @@ TABLE_ORDER = (
     'player_game_stats',
 )
 
+# Statuses that a manifest task may carry before a build is allowed.
+BUILDABLE_STATUSES = ('verified', 'retrieved', 'not_started')
 
-def _read_offline_fetcher(*args, **kwargs):
-    """Fetcher stub used to guarantee the build never touches the network."""
+
+def _offline_fetcher(*args, **kwargs):
+    """Fetcher stub that guarantees the build never touches the network."""
     raise RuntimeError('Offline only')
+
+
+def _unresolved_tasks(tasks):
+    """Return tasks whose status isn't buildable."""
+    return [t for t in tasks if t['status'] not in BUILDABLE_STATUSES]
+
+
+def _describe_task(task):
+    """Return a one-line description of a task for error messages."""
+    detail = task.get('error') or task.get('reason') or task['status']
+    return f"{task['season']} {task['dataset']}: {detail}"
+
+
+def _expected_log_params(season, kind, mode):
+    """Return the request params a full-season snapshot must carry."""
+    return dict(
+        season=season,
+        season_type_all_star=kind,
+        player_or_team_abbreviation=mode,
+        league_id='00',
+        date_from_nullable='',
+        date_to_nullable='',
+    )
 
 
 def prepare(manifest_path, overrides=None):
     """Validate exact manifest snapshots, never fetch or rewrite raw data.
 
-    Returns a dict of table name -> list of rows, ready to load.
-    Raises ValueError if the manifest is unfinished, contains failed or
-    partial tasks, references inconsistent snapshots, or fails
-    revalidation against the season schedule.
+    Returns a dict of table name -> list of rows, ready to load. Raises
+    ValueError if the manifest is unfinished, contains unresolved tasks,
+    references inconsistent snapshots, or fails revalidation against the
+    season schedule.
     """
     manifest_path = Path(manifest_path)
     report = json.loads(manifest_path.read_text(encoding='utf-8'))
@@ -139,16 +184,17 @@ def prepare(manifest_path, overrides=None):
     tasks = report['tasks']
 
     # Reject any task that isn't clean; the operator must recollect first.
-    if any(t['status'] not in ('verified', 'retrieved', 'not_started')
-           for t in tasks):
+    unresolved = _unresolved_tasks(tasks)
+    if unresolved:
         raise ValueError(
-            'Manifest contains partial or failed tasks; resolve and recollect first'
+            'Manifest contains unresolved tasks: '
+            + '; '.join(_describe_task(t) for t in unresolved)
         )
 
     # Reject duplicate (season, dataset) entries.
     seen = set()
-    for t in tasks:
-        key = (t['season'], t['dataset'])
+    for task in tasks:
+        key = (task['season'], task['dataset'])
         if key in seen:
             raise ValueError(f'Duplicate manifest task: {key}')
         seen.add(key)
@@ -170,16 +216,18 @@ def prepare(manifest_path, overrides=None):
         """Read a snapshot, compute its stable ID, and record its source row."""
         p = Path(path)
         params, stamp, raw = read_snapshot(p)
-        sid = digest([params, stamp.isoformat(), digest(raw)])
-        sources[sid] = (sid, str(p), stamp, digest(raw), digest(params))
-        return params, raw, sid
+        snapshot_id = digest([params, stamp.isoformat(), digest(raw)])
+        sources[snapshot_id] = (
+            snapshot_id, str(p), stamp, digest(raw), digest(params)
+        )
+        return params, raw, snapshot_id
 
     # Client is used only for its validators; the offline fetcher makes
     # any accidental network call fail loudly.
     client = NBAClient(
         allow_partial=False,
         venue_overrides=overrides or {},
-        fetcher=_read_offline_fetcher,
+        fetcher=_offline_fetcher,
     )
 
     for season in sorted({t['season'] for t in tasks}):
@@ -238,15 +286,7 @@ def prepare(manifest_path, overrides=None):
 
                 # Full-season snapshots only: this build has no notion of
                 # incremental loads.
-                expected_params = dict(
-                    season=season,
-                    season_type_all_star=kind,
-                    player_or_team_abbreviation=mode,
-                    league_id='00',
-                    date_from_nullable='',
-                    date_to_nullable='',
-                )
-                if params != expected_params:
+                if params != _expected_log_params(season, kind, mode):
                     raise ValueError(
                         'Game log request mismatch; full-season snapshots required'
                     )
@@ -329,16 +369,20 @@ def prepare(manifest_path, overrides=None):
                             *stats, log_snapshot_id,
                         ))
 
-            # Preserve upcoming scheduled games (status 1 or 2) that have
-            # no verified result yet. Final games missing results are not
-            # invented here — the manifest should have failed validation
-            # before we get here.
+            # Preserve upcoming scheduled games (status 1 or 2) and
+            # documented cancellations that have no verified result yet.
+            # Final games missing verified results are not invented here —
+            # the manifest should have failed validation before we get here.
             for game_id, game in schedule.items():
-                if (not game_id.startswith(prefix)
-                        or str(game['game_status']) not in ('1', '2')
-                        or not game['home_team_id']
-                        or not game['away_team_id']):
+                if not game_id.startswith(prefix):
                     continue
+                is_upcoming = str(game['game_status']) in ('1', '2')
+                is_canceled = confirmed(game_id, season, schedule)
+                if not (is_upcoming or is_canceled):
+                    continue
+                if not game['home_team_id'] or not game['away_team_id']:
+                    continue
+
                 for team_id in (game['home_team_id'], game['away_team_id']):
                     teams.setdefault(team_id, (team_id, None, None))
                 games.setdefault(game_id, [
@@ -431,7 +475,7 @@ def build(manifest, database, *, replace=False, overrides=None):
 
             con.execute(
                 'INSERT INTO build_metadata VALUES (?,?,?)',
-                ['0.4.0', datetime.now(timezone.utc), str(manifest)],
+                ['0.4.1', datetime.now(timezone.utc), str(manifest)],
             )
             con.execute('COMMIT')
         finally:

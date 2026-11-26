@@ -10,7 +10,7 @@ For each requested season, this script:
    every task so an interrupted run can be resumed from the manifest.
 
 Coverage is "verified" only when the schedule says the season is complete
-and there are no missing, extra, wrong-team, or quarantined games;
+and there are no missing, extra, wrong-team, quarantined, or excluded games;
 otherwise it's "partial".
 """
 import argparse
@@ -142,6 +142,8 @@ def coverage(rows, schedule, kind, issues, team_rows=None):
         player_reference_available=team_rows is not None,
     )
 
+    # Excluded (cancelled) games are recorded by the caller, not counted
+    # as coverage problems here, so they don't affect the status.
     problems = missing or extra or wrong or team_mismatch or issues
     result['status'] = 'verified' if expected and not problems else 'partial'
     return result
@@ -170,7 +172,7 @@ def collect(client, seasons, manifest_path, *, kinds=tuple(KINDS),
     active_season = active_season or current_season()
 
     report = {
-        'version': '0.3.0',
+        'version': '0.4.1',
         'started_at': datetime.now(timezone.utc).isoformat(),
         'seasons': list(seasons),
         'tasks': [],
@@ -254,6 +256,8 @@ def collect(client, seasons, manifest_path, *, kinds=tuple(KINDS),
                     ))
                     continue
 
+                # Reset per-task client state so a stale value from a
+                # previous task can't leak into this one.
                 client.snapshot_path = None
                 client.issues = []
 
@@ -270,6 +274,11 @@ def collect(client, seasons, manifest_path, *, kinds=tuple(KINDS),
                         rows, schedule, kind, client.issues,
                         team_rows if mode == 'P' else None,
                     ))
+
+                    # Record documented cancellations separately so
+                    # downstream consumers can see what was excluded and
+                    # why, without counting them as coverage failures.
+                    entry['excluded_games'] = getattr(client, 'excluded', [])
 
                     # Player coverage needs team rows as a reference; if we
                     # asked for players but never collected teams, mark it

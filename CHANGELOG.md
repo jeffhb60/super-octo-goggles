@@ -2,6 +2,22 @@
 
 All notable changes to the NBA forecasting project are documented here. Version numbers follow the project's GitHub release history.
 
+## [0.4.1] — Historical cancellation recovery
+
+### Fixed
+- Recognize the documented 2013-04-16 Boston–Indiana cancellation only when both raw team records match the known identity, date and zero-stat signature, with no conflicting final schedule record.
+- Preserve raw records and report exclusions separately from quarantines. Unknown zero-minute games remain invalid.
+- List unresolved manifest tasks in database build errors.
+- Retain canceled schedule entries where available, with null results and a canceled lifecycle label.
+
+### Added
+- Offline recovery command (`ingestion.collectors.recover`) revalidates affected team/player groups from exact original snapshots and creates a new manifest.
+- Three regression tests for recovery, final schedule conflicts and unknown placeholders.
+
+### Known limitations
+- Cancellation registry covers only the documented game above; no blanket inference from zero statistics or schedule status.
+- Actual historical snapshots and DuckDB integration require local verification. Recovery does not fetch missing snapshots or accept custom venue overrides.
+
 ## [0.4.0] — DuckDB analytical database
 
 ### Added

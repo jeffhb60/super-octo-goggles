@@ -6,6 +6,8 @@ Design goals:
 - Validate strictly; when `allow_partial=False`, any quarantined game aborts the call.
 - When `allow_partial=True`, bad games are quarantined into `self.issues` and
   written to a `<snapshot>.quality.json` sidecar, and good rows are returned.
+- Documented cancellations are excluded from results entirely (they appear in
+  `self.excluded` in the quality report) rather than treated as failures.
 - Venue resolution comes from (in order) explicit `venue_overrides`, a caller-
   supplied `schedule_data` mapping, or a season schedule fetched on demand
   when `resolve_schedule=True`.
@@ -20,6 +22,7 @@ from pathlib import Path
 
 from .cache import atomic_json, candidates, save_snapshot, digest, read_snapshot
 from .schedule import parse_schedule
+from .cancellations import placeholder
 
 log = logging.getLogger(__name__)
 
@@ -74,9 +77,13 @@ class NBAClient:
         # When False, any quarantined game raises instead of returning partial data.
         self.allow_partial = allow_partial
 
-        # Populated by _process() / season_schedule(): quarantined issues,
-        # the current snapshot path, and the parsed season schedule (if any).
+        # Populated by _process() / season_schedule():
+        # - issues: games that failed validation
+        # - excluded: documented cancellations (not failures)
+        # - snapshot_path / schedule_snapshot_path: current on-disk snapshots
+        # - schedule: parsed season schedule, if any
         self.issues = []
+        self.excluded = []
         self.snapshot_path = None
         self.schedule_snapshot_path = None
         self.schedule = {}
@@ -189,12 +196,14 @@ class NBAClient:
         """Parse and validate a raw LeagueGameLog response.
 
         Returns the list of accepted row dicts. In team mode, invalid games
-        are quarantined into `self.issues` rather than aborting (the caller
+        are quarantined into `self.issues`, documented cancellations are
+        recorded in `self.excluded`, and neither aborts the call (the caller
         decides whether partial results are acceptable). Structural problems
         with the response as a whole raise DataError.
         """
-        # Reset per-call issue list.
+        # Reset per-call state.
         self.issues = []
+        self.excluded = []
 
         payload = json.loads(raw) if isinstance(raw, str) else raw
 
@@ -259,20 +268,101 @@ class NBAClient:
                 raise DataError(f'Duplicate key: {key}')
             seen_keys.add(key)
 
-            # Required outcome fields must be present.
-            if r['WL'] not in ('W', 'L') or r['PTS'] is None:
+            # Player rows are validated per-row; team rows are validated as
+            # a home/away pair below (where cancellations are also handled).
+            if mode != 'T' and (r['WL'] not in ('W', 'L') or r['PTS'] is None):
                 raise DataError(f'Incomplete result: {game_id}')
 
             games.setdefault(game_id, []).append(r)
             records.append(r)
 
         # In team mode, validate each home/away pair as a unit, resolve
-        # venue info, and attach annotations. Games that fail are quarantined.
+        # venue info, and attach annotations. Failures are quarantined;
+        # documented cancellations are excluded from the results.
         if mode == 'T':
             accepted = []
             for game_id, pair in games.items():
                 try:
-                    self._validate_team_pair(game_id, pair)
+                    # Documented cancellations have no played game, so
+                    # skip them entirely rather than treating them as errors.
+                    if placeholder(game_id, season, self.schedule, pair):
+                        self.excluded.append({
+                            'game_id': game_id,
+                            'reason': 'documented cancellation; no game played',
+                        })
+                        continue
+
+                    if any(r['WL'] not in ('W', 'L') or r['PTS'] is None
+                           for r in pair):
+                        raise DataError('Incomplete result')
+                    if len(pair) != 2 or len({r['GAME_DATE'] for r in pair}) != 1:
+                        raise DataError('Incomplete or inconsistent team pair')
+
+                    x, y = pair
+
+                    # Scores and win/loss flags must be mutually consistent.
+                    if (x['PTS'] == y['PTS']
+                            or x['WL'] == y['WL']
+                            or (x['PTS'] > y['PTS']) != (x['WL'] == 'W')):
+                        raise DataError('Inconsistent score')
+
+                    # If PLUS_MINUS is present, it must equal the point differential.
+                    for r, opponent in ((x, y), (y, x)):
+                        if (r['PLUS_MINUS'] is not None
+                                and r['PLUS_MINUS'] != r['PTS'] - opponent['PTS']):
+                            raise DataError('Inconsistent point differential')
+
+                    # Default home/away designation comes from the MATCHUP string.
+                    home = [r for r in pair if ' vs. ' in str(r['MATCHUP'])]
+                    away = [r for r in pair if ' @ ' in str(r['MATCHUP'])]
+
+                    # Prefer an explicit override; otherwise fall back to the schedule.
+                    override = self.venue_overrides.get(game_id)
+                    scheduled = self.schedule.get(game_id)
+
+                    if scheduled and override is None:
+                        override = scheduled
+                        # The schedule must reference exactly the two teams in the log.
+                        schedule_teams = {
+                            str(scheduled['home_team_id']),
+                            str(scheduled['away_team_id']),
+                        }
+                        log_teams = {str(r['TEAM_ID']) for r in pair}
+                        if schedule_teams != log_teams:
+                            raise DataError('Schedule team IDs conflict with game log')
+
+                    if override is not None:
+                        # Explicit overrides must carry neutral_site and source;
+                        # the schedule records are trusted as-is.
+                        if (override is not scheduled
+                                and not isinstance(override.get('neutral_site'), bool)):
+                            raise DataError('Venue override requires neutral_site and source')
+                        if not str(override.get('source', '')).strip():
+                            raise DataError('Venue override requires neutral_site and source')
+
+                        home = [r for r in pair
+                                if str(r['TEAM_ID']) == str(override.get('home_team_id'))]
+                        away = [r for r in pair
+                                if str(r['TEAM_ID']) == str(override.get('away_team_id'))]
+
+                    # Exactly one home and one away row are required, and they must differ.
+                    if len(home) != 1 or len(away) != 1 or home[0] is away[0]:
+                        raise DataError('Unknown home/away designation')
+
+                    # Annotate the rows so downstream code doesn't re-derive venue info.
+                    for r in (home[0], away[0]):
+                        r['IS_HOME'] = r is home[0]
+                        r['NEUTRAL_SITE'] = override['neutral_site'] if override else None
+                        r['VENUE_SOURCE'] = (
+                            override['source'] if override else 'LeagueGameLog.MATCHUP'
+                        )
+                        if scheduled:
+                            r['ARENA'] = scheduled['arena']
+                            r['ARENA_CITY'] = scheduled['city']
+                            r['ARENA_STATE'] = scheduled['state']
+                            r['ARENA_COUNTRY'] = scheduled['country']
+                            r['SCHEDULED_TIPOFF_UTC'] = scheduled['scheduled_tipoff_utc']
+
                     accepted.extend(pair)
                 except DataError as exc:
                     self.issues.append({
@@ -280,89 +370,12 @@ class NBAClient:
                         'reason': str(exc),
                         'rows': pair,
                     })
+
             if self.issues:
                 log.warning('Quarantined %s games', len(self.issues))
             records = accepted
 
         return records
-
-    def _validate_team_pair(self, game_id, pair):
-        """Validate a single game's two team rows and annotate venue fields.
-
-        Venue resolution order: explicit `venue_overrides` wins; otherwise
-        the parsed season schedule (if available) supplies home/away and
-        arena details. Mutates each row to add IS_HOME, NEUTRAL_SITE,
-        VENUE_SOURCE, and (when the schedule is known) ARENA* fields.
-        Raises DataError if the pair is inconsistent.
-        """
-        # A game must have exactly two rows with the same date.
-        if len(pair) != 2 or len({r['GAME_DATE'] for r in pair}) != 1:
-            raise DataError('Incomplete or inconsistent team pair')
-
-        x, y = pair
-
-        # Scores and win/loss flags must be mutually consistent.
-        if (x['PTS'] == y['PTS']
-                or x['WL'] == y['WL']
-                or (x['PTS'] > y['PTS']) != (x['WL'] == 'W')):
-            raise DataError('Inconsistent score')
-
-        # If PLUS_MINUS is present, it must equal the point differential.
-        for r, opponent in ((x, y), (y, x)):
-            if (r['PLUS_MINUS'] is not None
-                    and r['PLUS_MINUS'] != r['PTS'] - opponent['PTS']):
-                raise DataError('Inconsistent point differential')
-
-        # Default home/away designation comes from the MATCHUP string.
-        home = [r for r in pair if ' vs. ' in str(r['MATCHUP'])]
-        away = [r for r in pair if ' @ ' in str(r['MATCHUP'])]
-
-        # Prefer an explicit override; otherwise fall back to the schedule.
-        override = self.venue_overrides.get(game_id)
-        scheduled = self.schedule.get(game_id)
-
-        if scheduled and override is None:
-            override = scheduled
-            # The schedule must reference exactly the two teams in the log.
-            schedule_teams = {
-                str(scheduled['home_team_id']),
-                str(scheduled['away_team_id']),
-            }
-            log_teams = {str(r['TEAM_ID']) for r in pair}
-            if schedule_teams != log_teams:
-                raise DataError('Schedule team IDs conflict with game log')
-
-        if override is not None:
-            # Explicit overrides must carry neutral_site and source; the
-            # schedule records are trusted as-is.
-            if (override is not scheduled
-                    and not isinstance(override.get('neutral_site'), bool)):
-                raise DataError('Venue override requires neutral_site and source')
-            if not str(override.get('source', '')).strip():
-                raise DataError('Venue override requires neutral_site and source')
-
-            home = [r for r in pair
-                    if str(r['TEAM_ID']) == str(override.get('home_team_id'))]
-            away = [r for r in pair
-                    if str(r['TEAM_ID']) == str(override.get('away_team_id'))]
-
-        # Exactly one home and one away row are required, and they must differ.
-        if len(home) != 1 or len(away) != 1 or home[0] is away[0]:
-            raise DataError('Unknown home/away designation')
-
-        # Annotate the rows so downstream code doesn't re-derive venue info.
-        for r in (home[0], away[0]):
-            r['IS_HOME'] = r is home[0]
-            r['NEUTRAL_SITE'] = override['neutral_site'] if override else None
-            r['VENUE_SOURCE'] = (
-                override['source'] if override else 'LeagueGameLog.MATCHUP'
-            )
-            if scheduled:
-                r['ARENA'] = scheduled['arena']
-                r['ARENA_CITY'] = scheduled['city']
-                r['ARENA_STATE'] = scheduled['state']
-                r['ARENA_COUNTRY'] = scheduled['country']
-                r['SCHEDULED_TIPOFF_UTC'] = scheduled['scheduled_tipoff_utc']
 
     def _process(self, raw, mode, start, end, season, path):
         """Validate a raw response, write a quality report, and enforce policy.
@@ -373,6 +386,7 @@ class NBAClient:
         """
         self.snapshot_path = path
         self.issues = []
+        self.excluded = []
         try:
             records = self._validate(raw, mode, start, end, season)
         except (ValueError, KeyError, TypeError) as exc:
@@ -395,9 +409,13 @@ class NBAClient:
         return records
 
     def _report(self, path):
-        """Write the current issues list to a `<path>.quality.json` sidecar."""
+        """Write the current issues/excluded lists to a `.quality.json` sidecar."""
         report = Path(str(path) + '.quality.json')
-        atomic_json(report, {'snapshot': str(path), 'issues': self.issues})
+        atomic_json(report, {
+            'snapshot': str(path),
+            'issues': self.issues,
+            'excluded': self.excluded,
+        })
 
     def game_logs(self, season, season_type='Regular Season', mode='T',
                   start=None, end=None, reuse_cache=False,
