@@ -1,9 +1,12 @@
 """Command-line probe for the NBA Stats client.
 
-Fetches a LeagueGameLog response, prints a short summary, and reports any
-data-quality issues the client quarantined. Exits with status 2 if issues
-were found, and performs a known-count coverage check for the 2022-23
-regular season.
+Two modes:
+
+- Default: fetch a LeagueGameLog, print a summary, optionally cross-check
+  games against the season schedule, check coverage for the full 2022-23
+  regular season, and exit 2 if any games were quarantined.
+- --schedule-only: fetch just the season schedule and print neutral-site
+  and otherwise notable games, then exit.
 """
 import argparse
 import json
@@ -13,12 +16,18 @@ from pathlib import Path
 
 from ingestion.clients.nba import NBAClient
 
+
 # Expected number of games in the 2022-23 regular season. Used only as a
 # probe; other queries aren't checked against a known total.
 EXPECTED_2022_23_REGULAR_SEASON_GAMES = 1230
 
 # Exit code used when the client quarantined one or more games.
 EXIT_QUARANTINE = 2
+
+# A game ID that was previously disputed; printed for spot-checking when
+# the schedule is resolved.
+PREVIOUSLY_DISPUTED_GAME_ID = '0022600189'
+
 
 def current_season(today=None):
     """Return the current NBA season as YYYY-YY.
@@ -55,6 +64,16 @@ def parse_args(argv=None):
              '(default: %(default)s).',
     )
     parser.add_argument(
+        '--resolve-schedule',
+        action='store_true',
+        help='Cross-check fetched games against the season schedule.',
+    )
+    parser.add_argument(
+        '--schedule-only',
+        action='store_true',
+        help='Fetch and print only the season schedule, then exit.',
+    )
+    parser.add_argument(
         '--players',
         action='store_true',
         help='Fetch player-level logs (mode P) instead of team-level (mode T).',
@@ -82,6 +101,23 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def print_schedule(schedule, snapshot_path):
+    """Print a summary of the season schedule and notable games."""
+    print('Schedule games:', len(schedule))
+    print(
+        'Neutral games:',
+        sum(g['neutral_site'] is True for g in schedule.values()),
+    )
+    print('Snapshot:', snapshot_path)
+
+    # Print neutral-site games and the previously disputed game for
+    # spot-checking.
+    for game in schedule.values():
+        if (game['neutral_site'] is True
+                or game['game_id'] == PREVIOUSLY_DISPUTED_GAME_ID):
+            print(game)
+
+
 def summarize(rows):
     """Print basic statistics about the fetched rows and return unique game IDs."""
     games = {r['GAME_ID'] for r in rows}
@@ -95,6 +131,19 @@ def summarize(rows):
     print('Columns:', ', '.join(rows[0]))
 
     return games
+
+
+def report_schedule_resolution(client, games):
+    """Print how the fetched games line up with the season schedule."""
+    print('Schedule snapshot:', client.schedule_snapshot_path)
+    print('Games matched to schedule:', len(games & client.schedule.keys()))
+    print('Games missing schedule:', len(games - client.schedule.keys()))
+
+    if PREVIOUSLY_DISPUTED_GAME_ID in client.schedule:
+        print(
+            'Previously disputed game:',
+            client.schedule[PREVIOUSLY_DISPUTED_GAME_ID],
+        )
 
 
 def check_2022_23_coverage(games):
@@ -133,6 +182,12 @@ if __name__ == '__main__':
         venue_overrides=load_venue_overrides(args.venue_overrides),
     )
 
+    # Schedule-only mode: fetch and print the schedule, then exit.
+    if args.schedule_only:
+        schedule = client.season_schedule(args.season, args.reuse_cache)
+        print_schedule(schedule, client.schedule_snapshot_path)
+        raise SystemExit(0)
+
     rows = client.game_logs(
         season=args.season,
         season_type=args.season_type,
@@ -140,9 +195,15 @@ if __name__ == '__main__':
         start=args.start,
         end=args.end,
         reuse_cache=args.reuse_cache,
+        resolve_schedule=args.resolve_schedule,
     )
 
     games = summarize(rows)
+
+    # Optional cross-check: report how many fetched games were found in
+    # the season schedule (and vice versa).
+    if args.resolve_schedule:
+        report_schedule_resolution(client, games)
 
     # Only check coverage for the specific query we know the answer to:
     # the full 2022-23 regular season with no date filtering.
