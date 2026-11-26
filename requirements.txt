@@ -1,1 +1,4 @@
 nba_api>=1.6,<3
+
+duckdb>=1.1,<2
+pandas>=1.5,<4
