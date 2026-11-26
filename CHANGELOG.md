@@ -2,6 +2,21 @@
 
 All notable changes to the NBA forecasting project are documented here. Version numbers follow the project's GitHub release history.
 
+## [0.4.0] — DuckDB analytical database
+
+### Added
+- Offline manifest-driven database builder (`ingestion/loaders/duckdb.py`) with dry-run validation and explicit replacement.
+- Typed games, teams, players, team and player game statistics, snapshot provenance and build metadata tables.
+- `game_results` view exposing signed home margin and home win labels for completed games only.
+- Revalidation of snapshot hashes, game coverage and team/player relationships; rejection of incomplete manifests.
+- Staged database rebuild so a failed build does not overwrite the existing database.
+- Four loader tests (three passed offline; one DuckDB integration test requires DuckDB and pandas).
+
+### Known limitations
+- DuckDB integration and full historical performance are not verified in the development environment; install dependencies and run tests locally.
+- Rebuilds use one explicitly selected completed manifest; incremental upserts and independent schedule completeness verification are future work.
+- Unknown arena metadata stays null; upcoming games with unassigned teams are omitted. Team/player names are observed labels, not historical dimension versions.
+
 ## [0.3.0] — Historical bulk collection
 
 ### Added
