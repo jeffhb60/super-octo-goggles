@@ -6,8 +6,9 @@ Design goals:
 - Validate strictly; when `allow_partial=False`, any quarantined game aborts the call.
 - When `allow_partial=True`, bad games are quarantined into `self.issues` and
   written to a `<snapshot>.quality.json` sidecar, and good rows are returned.
-- Venue resolution can come from explicit `venue_overrides` or from the season
-  schedule (fetched on demand when `resolve_schedule=True`).
+- Venue resolution comes from (in order) explicit `venue_overrides`, a caller-
+  supplied `schedule_data` mapping, or a season schedule fetched on demand
+  when `resolve_schedule=True`.
 """
 import json
 import logging
@@ -43,6 +44,13 @@ GAME_ID_PATTERN = re.compile(r'\d{10}')
 SEASON_PATTERN = re.compile(r'\d{4}-\d{2}')
 
 
+def _season_is_valid(season):
+    """Return True if `season` is YYYY-YY with consecutive years."""
+    if not SEASON_PATTERN.fullmatch(season):
+        return False
+    return int(season[-2:]) == (int(season[:4]) + 1) % 100
+
+
 class NBAClient:
     def __init__(self, cache_dir='data/raw/api', timeout=60, attempts=3,
                  min_interval=2.0, fetcher=None, venue_overrides=None,
@@ -61,7 +69,7 @@ class NBAClient:
         # Monotonic timestamp of the last request, used to throttle calls.
         self.last_request = None
 
-        # Per-game venue overrides keyed by game ID; see _validate().
+        # Per-game venue overrides keyed by game ID; see _validate_team_pair().
         self.venue_overrides = venue_overrides or {}
         # When False, any quarantined game raises instead of returning partial data.
         self.allow_partial = allow_partial
@@ -93,14 +101,42 @@ class NBAClient:
             timeout=timeout,
         ).get_json()
 
+    def _throttle(self):
+        """Sleep just enough to keep requests `interval` seconds apart."""
+        if self.last_request is not None:
+            elapsed = time.monotonic() - self.last_request
+            time.sleep(max(0, self.interval - elapsed))
+        self.last_request = time.monotonic()
+
+    def _request_with_retries(self, fetcher, params):
+        """Call `fetcher(params, timeout)` with throttling, retries, and backoff.
+
+        Returns the raw response. Re-raises the last exception if every
+        attempt fails.
+        """
+        raw = None
+        for attempt in range(self.attempts):
+            self._throttle()
+            try:
+                raw = fetcher(params, self.timeout)
+            except Exception as exc:
+                log.warning('Request %s/%s failed: %s',
+                            attempt + 1, self.attempts, exc)
+                if attempt + 1 == self.attempts:
+                    raise
+                # Exponential backoff with jitter, capped at 60s.
+                time.sleep(min(60, 2 ** (attempt + 1)) + random.random())
+                continue
+            break
+        return raw
+
     def season_schedule(self, season, reuse_cache=False):
         """Fetch (or reuse a cached) season schedule and parse it.
 
         Populates and returns `self.schedule` (a dict keyed by game ID).
         On success, `self.schedule_snapshot_path` points at the snapshot.
         """
-        if (not SEASON_PATTERN.fullmatch(season)
-                or int(season[-2:]) != (int(season[:4]) + 1) % 100):
+        if not _season_is_valid(season):
             raise ValueError('Season must be YYYY-YY')
 
         self.schedule = {}
@@ -123,23 +159,7 @@ class NBAClient:
                     continue
 
         # Otherwise fetch with retries.
-        for attempt in range(self.attempts):
-            # Throttle: wait until `interval` seconds have elapsed since
-            # the previous request.
-            if self.last_request is not None:
-                elapsed = time.monotonic() - self.last_request
-                time.sleep(max(0, self.interval - elapsed))
-            self.last_request = time.monotonic()
-
-            try:
-                raw = self.schedule_fetcher(params, self.timeout)
-            except Exception:
-                if attempt + 1 == self.attempts:
-                    raise
-                # Exponential backoff with jitter, capped at 60s.
-                time.sleep(min(60, 2 ** (attempt + 1)) + random.random())
-                continue
-            break
+        raw = self._request_with_retries(self.schedule_fetcher, params)
 
         # Decode string bodies when possible, but keep malformed payloads.
         if isinstance(raw, str):
@@ -381,7 +401,7 @@ class NBAClient:
 
     def game_logs(self, season, season_type='Regular Season', mode='T',
                   start=None, end=None, reuse_cache=False,
-                  resolve_schedule=False):
+                  resolve_schedule=False, schedule_data=None):
         """Fetch (or reuse a cached) LeagueGameLog response.
 
         Args:
@@ -392,13 +412,15 @@ class NBAClient:
             reuse_cache: if True, prefer the newest cached snapshot.
             resolve_schedule: if True, fetch the season schedule first and
                 use it to resolve home/away and arena details.
+            schedule_data: optional pre-parsed schedule mapping (game ID ->
+                schedule record) to use instead of fetching. Mutually
+                exclusive with `resolve_schedule`.
 
         On success, `self.issues` and `self.snapshot_path` describe the
         response that produced the returned rows.
         """
         # Validate season format and that the two years are consecutive.
-        if (not SEASON_PATTERN.fullmatch(season)
-                or int(season[-2:]) != (int(season[:4]) + 1) % 100):
+        if not _season_is_valid(season):
             raise ValueError('Season must be YYYY-YY')
 
         if mode not in ('T', 'P'):
@@ -407,8 +429,14 @@ class NBAClient:
         if start and end and start > end:
             raise ValueError('Start must precede end')
 
-        # Reset any schedule state from a previous call.
-        self.schedule = {}
+        # A caller can either pass a pre-parsed schedule or ask us to fetch
+        # one, but not both — the two would silently disagree.
+        if resolve_schedule and schedule_data is not None:
+            raise ValueError('Choose resolve_schedule or schedule_data, not both')
+
+        # Reset any schedule state from a previous call, then populate it
+        # from the caller's mapping or by fetching.
+        self.schedule = {} if schedule_data is None else dict(schedule_data)
         if resolve_schedule:
             self.season_schedule(season, reuse_cache=reuse_cache)
 
@@ -428,31 +456,14 @@ class NBAClient:
                 return self._process(raw, mode, start, end, season, path)
 
         # Otherwise fetch with retries.
-        for attempt in range(self.attempts):
-            # Throttle: wait until `interval` seconds have elapsed since
-            # the previous request.
-            if self.last_request is not None:
-                elapsed = time.monotonic() - self.last_request
-                time.sleep(max(0, self.interval - elapsed))
-            self.last_request = time.monotonic()
+        raw = self._request_with_retries(self.fetcher, params)
 
-            try:
-                raw = self.fetcher(params, self.timeout)
-            except Exception as exc:
-                log.warning('Request %s/%s failed: %s',
-                            attempt + 1, self.attempts, exc)
-                if attempt + 1 == self.attempts:
-                    raise
-                # Exponential backoff with jitter, capped at 60s.
-                time.sleep(min(60, 2 ** (attempt + 1)) + random.random())
-                continue
+        # Persist the raw response BEFORE validating so the snapshot
+        # is available for debugging even if validation fails.
+        stamp = datetime.now(timezone.utc)
+        path = save_snapshot(self.cache, params, stamp, raw)
+        log.info('Saved raw response to %s', path)
 
-            # Persist the raw response BEFORE validating so the snapshot
-            # is available for debugging even if validation fails.
-            stamp = datetime.now(timezone.utc)
-            path = save_snapshot(self.cache, params, stamp, raw)
-            log.info('Saved raw response to %s', path)
-
-            records = self._process(raw, mode, start, end, season, path)
-            log.info('Validated %s rows', len(records))
-            return records
+        records = self._process(raw, mode, start, end, season, path)
+        log.info('Validated %s rows', len(records))
+        return records
